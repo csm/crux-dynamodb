@@ -2,7 +2,7 @@
   (:require [crux.io :as cio]
             [clojure.tools.logging :as log])
   (:import (software.amazon.awssdk.services.dynamodb DynamoDbAsyncClient)
-           (software.amazon.awssdk.services.dynamodb.model GetItemRequest AttributeValue GetItemResponse UpdateItemRequest PutItemRequest CreateTableRequest AttributeDefinition ScalarAttributeType KeySchemaElement KeyType ProvisionedThroughput ConditionalCheckFailedException BatchWriteItemRequest PutRequest ScanRequest ScanResponse DescribeTableRequest DescribeTableResponse ResourceNotFoundException WriteRequest)
+           (software.amazon.awssdk.services.dynamodb.model GetItemRequest AttributeValue GetItemResponse UpdateItemRequest PutItemRequest CreateTableRequest AttributeDefinition ScalarAttributeType KeySchemaElement KeyType ProvisionedThroughput ConditionalCheckFailedException BatchWriteItemRequest PutRequest ScanRequest ScanResponse DescribeTableRequest DescribeTableResponse ResourceNotFoundException WriteRequest TableStatus)
            (java.util.function Function)
            (java.util.concurrent Executors ScheduledExecutorService TimeUnit CompletableFuture ExecutionException)
            (crux.dynamodb DynamoDBConfigurator)
@@ -57,6 +57,14 @@
 (def ^:private -catch (reify Function (apply [_ e] e)))
 
 (def ^:private -nop (reify Callable (call [_] nil)))
+
+(defn- ^CompletableFuture delayed-future
+  [delay ^TimeUnit delay-units]
+  (let [future (CompletableFuture.)]
+    (.schedule retry-executor (reify Callable
+                                (call [_] (.complete future true)))
+               (long delay) delay-units)
+    future))
 
 (def ^:private attribute-definitions [(-> (AttributeDefinition/builder)
                                           (.attributeName "part")
@@ -115,6 +123,21 @@
                 (CompletableFuture/completedFuture :ok))
               (create-table configurator client table-name)))))))
 
+(defn ensure-table-ready
+  [^DynamoDbAsyncClient client table-name]
+  (-> (.describeTable client ^DescribeTableRequest (-> (DescribeTableRequest/builder)
+                                                       (.tableName table-name)
+                                                       (.build)))
+      (.thenCompose
+        (reify Function
+          (apply [_ result]
+            (if (some-> ^DescribeTableResponse result (.table) (.tableStatus) (= TableStatus/ACTIVE))
+              (CompletableFuture/completedFuture true)
+              (.thenCompose (delayed-future 1 TimeUnit/SECONDS)
+                            (reify Function
+                              (apply [_ _]
+                                (ensure-table-ready client table-name))))))))))
+
 ; tx IDs encoded as:
 ; [1 bit 0] [49 bits partition ID] [14 bits tx ID]
 ;
@@ -169,14 +192,6 @@
                         (log/info (pr-str {:task ::increment-tx :phase :end :next-part next-part :next-tx next-tx :ms (- (System/currentTimeMillis) start)}))
                         [next-part next-tx]))))))
 
-(defn- ^CompletableFuture delayed-future
-  [delay ^TimeUnit delay-units]
-  (let [future (CompletableFuture.)]
-    (.schedule retry-executor (reify Callable
-                                (call [_] (.complete future true)))
-               (long delay) delay-units)
-    future))
-
 (defn select-next-txid
   [^DynamoDbAsyncClient client table-name & {:keys [delay] :or {delay 10}}]
   (let [start (System/currentTimeMillis)]
@@ -192,9 +207,9 @@
           (.thenCompose (reify Function
                           (apply [_ response]
                             (log/debug (pr-str {:task ::select-next-txid :phase :read-db-info :info response :ms (- (System/currentTimeMillis) start)}))
-                            (if (.hasItem response)
-                              (increment-tx client table-name (-> response (.item) (get "currentPartition") (Long/parseLong))
-                                            (-> response (.item) (get "currentTx") (Long/parseLong)))
+                            (if (.hasItem ^GetItemResponse response)
+                              (increment-tx client table-name (-> ^GetItemResponse response (.item) ^AttributeValue (get "currentPartition") (.n) (Long/parseLong))
+                                            (-> ^GetItemResponse response (.item) ^AttributeValue (get "currentTx") (.n) (Long/parseLong)))
                               (init-tx-info client table-name)))))
           (.exceptionally -catch)
           (.thenCompose
@@ -252,7 +267,7 @@
                       (.thenApply (reify Function
                                     (apply [_ _]
                                       (log/info (pr-str {:task ::write-events :phase :end :ms (- (System/currentTimeMillis) start)}))
-                                      {:crux.tx/tx-id   (id->tx-id part tx)
+                                      {:crux.tx/tx-id   (id->tx-id part (bit-shift-left tx 17))
                                        :crux.tx/tx-time tx-date}))))))))))))
 
 (declare last-tx)
@@ -260,29 +275,31 @@
 (defn- scan-seq
   [part ^DynamoDbAsyncClient client ^ScanRequest request]
   (lazy-seq
-    ;(log/debug "scan-seq" request)
+    ; (log/debug "scan-seq" request)
     (let [response ^ScanResponse @(.scan client request)]
-      (cond (and (pos? (.count response))
-                 (not-empty (.lastEvaluatedKey response)))
+      ; (log/debug "scan response: " response)
+      (if (and (pos? (.count response))
+               (not-empty (.lastEvaluatedKey response)))
+        (cons (.items response)
+              (scan-seq part client
+                        (-> request
+                            (.toBuilder)
+                            (.exclusiveStartKey (.lastEvaluatedKey response))
+                            (.build))))
+        (let [next-part (inc part)
+              max-part (some-> (last-tx client (.tableName request))
+                               (deref)
+                               (:crux.tx/tx-id)
+                               (->part))]
+          ;(log/debug "scan-seq next-part" next-part "max-part" max-part)
+          (if (and (some? max-part) (<= next-part max-part))
             (cons (.items response)
-                  (scan-seq part client
+                  (scan-seq next-part client
                             (-> request
                                 (.toBuilder)
-                                (.exclusiveStartKey (.lastEvaluatedKey response))
-                                (.build))))
-
-            (zero? (.count response))
-            (let [next-part (inc part)
-                  max-part (some-> (last-tx client (.tableName request))
-                                   (deref)
-                                   (:crux.tx/tx-id)
-                                   (->part))]
-              (when (and (some? max-part) (<= next-part max-part))
-                (cons (.items response)
-                      (scan-seq next-part client
-                                (-> request
-                                    (.toBuilder)
-                                    (.expressionAttributeValues {":part" (N next-part)}))))))))))
+                                (.exclusiveStartKey nil)
+                                (.expressionAttributeValues {":part" (N next-part)}))))
+            [(.items response)]))))))
 
 (defn- item->txid
   [item]
@@ -295,28 +312,25 @@
   (log/debug "group->tx-info group: " (pr-str group))
   (let [[meta & events] group
         txid (item->txid meta)
-        meta (.thaw configurator (-> meta ^AttributeValue (get "data") (.b)))]
+        meta (.thaw configurator (-> meta ^AttributeValue (get "data") (.b) (.asByteArray)))]
     {:crux.tx/tx-id txid
      :crux.tx/tx-time (second meta)
-     :crux.tx.event/tx-events (map #(.thaw configurator (.b ^AttributeValue (get % "data"))) events)}))
+     :crux.tx.event/tx-events (map #(.thaw configurator (.asByteArray (.b ^AttributeValue (get % "data")))) events)}))
 
 (defn tx-iterator
   [^DynamoDBConfigurator configurator ^DynamoDbAsyncClient client table-name after-tx-id]
   (let [start-tx-id (when after-tx-id (tx-id->end-id after-tx-id))
-        scan-request (cond-> (ScanRequest/builder)
-                             :then (.tableName table-name)
-                             (some? start-tx-id) (.exclusiveStartKey {"part" (first start-tx-id)
-                                                                      "tx"   (second start-tx-id)})
-                             :then (.filterExpression "#part = :part")
-                             :then (.expressionAttributeNames {"#part" "part"})
-                             :then (.expressionAttributeValues {":part" (N (or (first start-tx-id) 0))})
-                             :then (.consistentRead true)
-                             :then (.build))
-        tx-iter (->> (scan-seq (or (first start-tx-id) 0) client scan-request)
-                     (mapcat identity)
-                     (partition-by item->txid)
-                     (remove empty?)
-                     (map (partial group->tx-info configurator)))]
+        scan-request (.build (cond-> (-> (ScanRequest/builder)
+                                         (.tableName table-name)
+                                         (.filterExpression "#part = :part")
+                                         (.expressionAttributeNames {"#part" "part"})
+                                         (.expressionAttributeValues {":part" (N (or (first start-tx-id) 0))}))
+                                     (some? start-tx-id) (.exclusiveStartKey {"part" (N (first start-tx-id))
+                                                                              "tx"   (N (second start-tx-id))})))
+        tx-iter (sequence (comp (mapcat identity)
+                                (partition-by item->txid)
+                                (map (partial group->tx-info configurator)))
+                          (scan-seq (or (first start-tx-id) 0) client scan-request))]
     (cio/->cursor #() tx-iter)))
 
 (defn last-tx
@@ -329,6 +343,8 @@
       (.thenApply
         (reify Function
           (apply [_ item]
-            (when-let [item (.item ^GetItemResponse item)]
-              {:crux.tx/tx-id (id->tx-id (-> item ^AttributeValue (get "currentPartition") (.n) (Long/parseLong))
-                                         (-> item ^AttributeValue (get "currentTx") (.n) (Long/parseLong)))}))))))
+            (when item
+              (when-let [item (.item ^GetItemResponse item)]
+                (when-let [part (some-> item ^AttributeValue (get "currentPartition") (.n) (Long/parseLong))]
+                  (when-let [tx (some-> item ^AttributeValue (get "currentTx") (.n) (Long/parseLong))]
+                    {:crux.tx/tx-id (id->tx-id part tx)})))))))))

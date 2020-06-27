@@ -30,7 +30,8 @@
                                (let [client (.makeClient configurator)]
                                  (log/info "made dynamodb client:" client "checking table" table-name)
                                  @(tx/ensure-table-exists configurator client table-name)
-                                 (log/info "dynamodb table created, creating tx-log")
+                                 @(tx/ensure-table-ready client table-name)
+                                 (log/info "dynamodb table ready, creating tx-log")
                                  (->DynamoDBTxLog configurator client table-name)))
                    :args     {::table-name {:required?        true
                                             :crux.config/type ::table-name
