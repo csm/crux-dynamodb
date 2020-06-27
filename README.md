@@ -1,5 +1,7 @@
 # crux-dynamodb
 
+[![com.github.csm/crux-dynamodb](https://img.shields.io/clojars/v/com.github.csm/crux-dynamodb.svg)](https://clojars.org/com.github.csm/crux-dynamodb)
+
 A [crux](https://opencrux.com) tx-log on AWS DynamoDB.
 
 ## Getting Started
