@@ -1,4 +1,4 @@
-(defproject com.github.csm/crux-dynamodb "0.1.0-SNAPSHOT"
+(defproject com.github.csm/crux-dynamodb "0.1.0"
   :description "Crux TX logs on DynamoDB"
   :url "https://github.com/csm/crux-dynamodb"
   :license {:name "MIT"
