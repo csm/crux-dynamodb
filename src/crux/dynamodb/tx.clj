@@ -61,8 +61,8 @@
 (defn- ^CompletableFuture delayed-future
   [delay ^TimeUnit delay-units]
   (let [future (CompletableFuture.)]
-    (.schedule retry-executor (reify Callable
-                                (call [_] (.complete future true)))
+    (.schedule @retry-executor (reify Callable
+                                 (call [_] (.complete future true)))
                (long delay) delay-units)
     future))
 
